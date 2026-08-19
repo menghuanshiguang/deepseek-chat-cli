@@ -143,8 +143,10 @@ def wait_for(js_script, timeout=30, interval=1.0, desc="条件"):
     log(f"[dsc] 等待超时({timeout}s): {desc}")
     return False
 
-def send_and_wait(prompt, timeout=120):
+def send_and_wait(prompt, timeout=None):
     """输入问题,发送(等发送成功),轮询回答直到稳定"""
+    if timeout is None:
+        timeout = int(os.environ.get("DSC_TIMEOUT", "300"))
     # 记录发送前最后一条回答的内容作基线(数量+文本, 兼容欢迎语占用 .ds-markdown 的场景)
     # 必须在发送前采样: 发送后采样会与快速回复竞态(回复2秒完成时基线直接采到完成态, 轮询永不触发)
     try:
@@ -209,12 +211,13 @@ def send_and_wait(prompt, timeout=120):
     """)
     if str(err_early).strip() == "rejected":
         return "(DeepSeek拒绝处理: 内容违反使用规范或消息未能发送 - 换个提示词)"
-    # 等回答开始出现: 消息条数增加 或 最后一条内容变化(流式生成)
+    # 等回答开始出现: 消息条数增加 或 最后一条内容变化(流式生成) 或 出现"停止生成"按钮
     poll_js = """
     var m=document.querySelectorAll('.ds-markdown');
-    if(!m.length) return 'false';
-    var last = m[m.length-1].innerText;
-    return String(m.length > %d || last !== %s);
+    var last = m.length? m[m.length-1].innerText : '';
+    var stop = [...document.querySelectorAll('div[role=button],button')].some(function(b){
+      var x=(b.innerText||'').trim(); return x.indexOf('停止')>=0 || x.indexOf('Stop')>=0;});
+    return String((m.length > %d) || (last !== %s) || stop);
     """ % (base_n, json.dumps(base_txt))
     appeared = wait_for(poll_js, timeout=timeout, interval=1, desc="回答开始出现")
     if not appeared:
@@ -652,9 +655,13 @@ def kill_stale():
 
 
 def get_page():
-    """连接常驻浏览器, 返回可用页面(优先当前激活页, 退而取第一个)"""
+    """连接常驻浏览器, 返回可用页面(优先 chat.deepseek.com 页面, 避免选错标签页)"""
     browser = _connect()
     ctx = browser.contexts[0]
+    # 优先当前激活且是 DeepSeek 的页面
+    for p in ctx.pages:
+        if not p.is_closed() and "chat.deepseek.com" in (p.url or ""):
+            return p
     for p in ctx.pages:
         if not p.is_closed() and p.url and p.url != "about:blank":
             return p
