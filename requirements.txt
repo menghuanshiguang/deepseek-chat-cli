@@ -1,0 +1,5 @@
+playwright
+opencv-python-headless
+numpy
+pillow
+scipy

@@ -1,0 +1,88 @@
+name: dsc
+
+on:
+  workflow_dispatch:
+    inputs:
+      phone:
+        description: '手机号，用于 --login 发送短信'
+        required: false
+      code:
+        description: '短信验证码，用于 --verify 完成登录'
+        required: false
+      prompt:
+        description: '提示词，用于直接对话（需已登录或有 DSV_TOKEN secret）'
+        required: false
+      keep:
+        description: '保留本次会话（默认用后即删）'
+        type: boolean
+        default: false
+
+jobs:
+  dsc:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+          python -m playwright install --with-deps chromium
+
+      - name: Restore browser profile
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.dsc_chrome_profile
+            ~/.dsv_token
+          key: dsc-profile-${{ github.actor }}-${{ inputs.phone }}
+
+      - name: Fresh profile for login
+        if: inputs.phone != '' && inputs.code == '' && inputs.prompt == ''
+        run: |
+          rm -rf "$HOME/.dsc_chrome_profile"
+          rm -f "$HOME/.dsv_token"
+
+      - name: Send SMS (login)
+        if: inputs.phone != '' && inputs.code == '' && inputs.prompt == ''
+        run: python dsc.py --login "${{ inputs.phone }}"
+
+      - name: Complete login (verify)
+        if: inputs.code != ''
+        run: python dsc.py --verify "${{ inputs.code }}"
+
+      - name: Prepare token artifact
+        if: inputs.code != ''
+        run: cp "$HOME/.dsv_token" ./dsv_token.txt
+
+      - name: Upload token artifact
+        if: inputs.code != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: dsv-token
+          path: dsv_token.txt
+          if-no-files-found: error
+
+      - name: Stop background browser
+        if: always()
+        run: pkill -f "[u]ser-data-dir=$HOME/.dsc_chrome_profile" || true
+
+      - name: Chat
+        if: inputs.prompt != ''
+        env:
+          DSV_TOKEN_SECRET: ${{ secrets.DSV_TOKEN }}
+        run: |
+          if [ -n "$DSV_TOKEN_SECRET" ]; then
+            printf '%s' "$DSV_TOKEN_SECRET" > "$HOME/.dsv_token"
+            chmod 600 "$HOME/.dsv_token"
+          fi
+          if [ "${{ inputs.keep }}" == "true" ]; then
+            python dsc.py --keep "${{ inputs.prompt }}"
+          else
+            python dsc.py "${{ inputs.prompt }}"
+          fi
