@@ -7,7 +7,8 @@
 - 默认**用后即删**：对话结束立即删除本次会话，不污染对话列表
 - 登录采用与参考项目相同的异步设计：`--login` 发短信后立即退出，`--verify` 完成登录并存 token
 
-> **已适配最新官网前端**（基于 `chat.deepseek.com` 的 `commit-id dda740b5` 逆向 `main.js` / `main.css` 校验）。
+> **已适配最新官网前端**（基于 `chat.deepseek.com` 的 `commit-id dda740b5` 逆向 `main.js` / `main.css` 校验；
+> **2026-09-10 对最新 `main.5748b4eb39` 真机端到端复测，修复 4 处回归**，详见文末）。
 > 本次修复的关键回归与现代站点契约见文末「[适配说明](#适配说明)」与「[选择器契约](#选择器契约)」。
 
 ---
@@ -174,9 +175,20 @@ dsc "<prompt>"
 | 9 | 文案 | 仅中文 | 站点按地区渲染 zh_CN / en_US | 关键文案全部中英双语匹配 |
 | 10 | 依赖 | `opencv-python-headless` 等 4 个重依赖 | 解题逻辑已废 | 移除，`dsc.py` 仅用标准库 |
 
-**未变（无需改）**：所有 API 路径、`Authorization: Bearer` 认证、`localStorage['userToken']` 仍是裸字符串、
+**未变（无需改）**：所有 API 路径、`Authorization: Bearer` 认证、`localStorage['userToken']` 为 `{"value":…,"__version":"0"}` JSON 包装（注：写入必须带 `__version` 包装，裸字符串会被站点 `JSON.parse` 回退成 `null`，永远卡 `/sign_in`）、
 回答容器 `.ds-markdown`、输入框仍是 `<textarea>`、`Enter` 发送 / `Shift+Enter` 换行、
 停止按钮 tooltip `停止生成`、`biz_code` 仍用于 `create_pow_challenge` 等业务接口。
+
+### 2026-09-10 真机复测修复（iSH + minis-browser-use）
+
+| # | 位置 | 问题 | 修复 |
+|---|---|---|---|
+| 1 | `ensure_login()` | token 按**裸字符串**写入 localStorage；站点 storage 层读取时 `JSON.parse(...).value`，解析失败回退 `null` → 永远卡 `/sign_in`，**完全无法对话** | 改回 `{"value": token, "__version": "0"}` JSON 包装 |
+| 2 | `send_and_wait()` 发送键 | 「最小面积」结构法被按钮**内部图标层**（`ds-button__icon`，面积更小）截胡 → 点到隔壁胶囊按钮，消息根本发不出去、等回答超时 | ① 排除按钮内部嵌套层（有 `ds-button` 祖先）② 优先精确 class token `ds-button--primary`（实测即发送键） |
+| 3 | `js()` 的 `clean()` | 空返回值实际尾巴为 `"  tab_id: 0"`（**无换行前缀**），旧正则漏匹配 → 假错误串 `tab_id: 0` 被当作「拒绝处理」误报 | 正则改为 `\s*tab_id:\s*\d+\s*$` |
+| 4 | `main()` 管道输入 | `echo xx \| dsc` 永远走不到 stdin 分支（无参数时先被当成「显示帮助」return）→ 管道模式死代码 | 无参数时优先读 stdin；子命令分发改 `sub = args[0] if args else None` 防越界 |
+
+验证方式：`dsc "<提示词>"` / `echo … | dsc` / `--keep` 三种入口端到端通过（登录注入 → 发消息 → 流式回答 → 用后即删）。
 
 ## 选择器契约
 

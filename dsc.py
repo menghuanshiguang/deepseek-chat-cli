@@ -2,7 +2,7 @@
 """
 dsc - DeepSeek C端对话CLI (纯文本对话版, 参考 dsv 设计)
 
-已适配 chat.deepseek.com 最新前端 (逆向 commit-id dda740b5 的 main.js/main.css 验证)。
+已适配 chat.deepseek.com 最新前端 (逆向 commit-id dda740b5; 2026-09-10 对 main.5748b4eb39 真机复测修复)。
 
 用法:
   dsc "你好"
@@ -108,9 +108,10 @@ def js(script):
 
     def clean(s):
         if isinstance(s, str):
-            # 去掉 minis-browser-use 附加的 "\n  tab_id: N" 尾巴
+            # 去掉 minis-browser-use 附加的 tab_id 尾巴
+            # (非空结果: "xxx\n  tab_id: 0"; 空结果: "  tab_id: 0" 无换行前缀, 旧正则漏匹配)
             import re
-            s = re.sub(r"\n\s*tab_id:\s*\d+", "", s).strip()
+            s = re.sub(r"\s*tab_id:\s*\d+\s*$", "", s).strip()
         return s
 
     def extract(v):
@@ -239,8 +240,10 @@ def ensure_login():
         return None
     run(["navigate", "--url", BASE + "/"])
     time.sleep(1.0)
-    # localStorage['userToken'] 是裸 token 字符串(前端 create("userToken",null,null))
-    js("localStorage.setItem('userToken', %s); location.reload();" % json.dumps(tok))
+    # localStorage['userToken'] 是 {"value": token, "__version": "0"} JSON 包装
+    # (站点 storage 层读取时 JSON.parse(...).value, 解析失败回退 null;
+    #  实测存裸字符串会永远卡在 /sign_in —— 2026-09-10 实测验证)
+    js("localStorage.setItem('userToken', JSON.stringify({value: %s, __version: '0'})); location.reload();" % json.dumps(tok))
     time.sleep(1.5)
     return tok
 
@@ -328,30 +331,44 @@ def send_and_wait(prompt, timeout=None):
     time.sleep(0.5)
 
     # ---- 点发送 ----
-    # 按「结构」而非硬编码 class 找发送键: ds-button--primary 只存在于 CSS,
-    # JS 里 0 命中(类名运行时组合), 旧版按 class 匹配的做法不可靠。
+    # 实测(2026-09-10, main.5748b4eb39): 真正的发送键 = 输入行最右的圆形主钮,
+    # class token 精确含 "ds-button--primary"。旧「最小面积」结构法会被按钮内部的
+    # 图标层(ds-button__icon / ds-button__background, 面积更小)截胡, 点到隔壁胶囊上,
+    # 表现为 textarea 不清空、消息根本没发出去、等回答超时。
+    # 修复: ① 排除按钮内部嵌套层(有 ds-button 祖先) ② 优先精确 token ds-button--primary
     r = js(JS_LIB + r"""
     var ta=__findInput(%s);
     if(!ta) return 'no_ta';
     var tr=ta.getBoundingClientRect();
-    var best=null, bestScore=1e9;
+    function __inBtn(e){
+      var p=e.parentElement, d=0;
+      while(p && d<10){
+        if((''+(p.getAttribute('class')||'')).indexOf('ds-button')>=0) return true;
+        p=p.parentElement; d++;
+      }
+      return false;
+    }
     var cands=[].slice.call(document.querySelectorAll('button,[role=button],div,span,a'));
+    var primary=null, best=null, bestScore=1e9;
     var i,e,cl,r2,s;
     for(i=0;i<cands.length;i++){
       e=cands[i];
       cl=(''+(e.getAttribute('class')||''));
       if(cl.indexOf('button')<0) continue;          // 只看按钮类组件
+      if(__inBtn(e)) continue;                       // 排除按钮内部嵌套层(图标/背景)
       if(!__vis(e)) continue;
       if(e.disabled===true || e.getAttribute('aria-disabled')==='true') continue;
       r2=e.getBoundingClientRect();
       // 与输入框同区: 垂直中心相距不超过 3 倍输入框高度
       if(Math.abs((r2.y+r2.height/2)-(tr.y+tr.height/2)) > Math.max(tr.height*3, 160)) continue;
+      if((' '+cl+' ').indexOf(' ds-button--primary ')>=0) primary=e;  // 精确 class token
       s=(r2.width*r2.height) + Math.abs(r2.x-tr.x)*0.4;
       if(s<bestScore){ bestScore=s; best=e; }
     }
-    if(!best) return 'no_send';
-    best.click();
-    return 'sent';
+    var hit=primary || best;
+    if(!hit) return 'no_send';
+    hit.click();
+    return primary ? 'sent(primary)' : 'sent(structural)';
     """ % jsl(PH_CHAT))
     log("[dsc] 发送:", r)
 
@@ -691,19 +708,21 @@ def main():
     args = [a for a in args if a not in ("--keep", "--headful")]
     if head:
         os.environ["DSC_HEADFUL"] = "1"
-    if not args or args[0] in ("-h", "--help"):
+    # 注意: 不能写成 "if not args 就显示帮助" —— 无参数时应优先尝试读管道 stdin
+    if args and args[0] in ("-h", "--help"):
         print(__doc__)
         return
-    if args[0] == "--login":
+    sub = args[0] if args else None
+    if sub == "--login":
         phone = args[1] if len(args) > 1 else None
         do_login(phone)
         return
-    if args[0] == "--verify":
+    if sub == "--verify":
         code = args[1] if len(args) > 1 else None
         if not do_verify(code):
             sys.exit(1)
         return
-    if args[0] == "--logout":
+    if sub == "--logout":
         if os.path.exists(TOKEN_FILE):
             os.remove(TOKEN_FILE)
             log("[dsc] 已删除本地 token")
