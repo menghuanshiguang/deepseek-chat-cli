@@ -48,6 +48,8 @@ jobs:
           rm -rf "$HOME/.dsc_chrome_profile"
           rm -f "$HOME/.dsv_token"
 
+      # 注意: 无头环境若触发风控(数美滑块 / hCaptcha), 发码会失败并 exit 3。
+      # 国内手机号建议在本地用 DSC_HEADFUL=1 登录一次, 再把 token 存为 DSV_TOKEN secret。
       - name: Send SMS (login)
         if: inputs.phone != '' && inputs.code == '' && inputs.prompt == ''
         run: python dsc.py --login "${{ inputs.phone }}"

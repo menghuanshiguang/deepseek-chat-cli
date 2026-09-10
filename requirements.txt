@@ -1,5 +1,13 @@
+# dsc.py 本身只用 Python 标准库; 以下依赖仅用于「驱动浏览器」。
+
+# Windows: 驱动系统自带 Edge/Chrome, 仍需 playwright 作为 CDP 客户端
 playwright
-opencv-python-headless
-numpy
-pillow
-scipy
+
+# 说明:
+#   - 旧版为破解数美「点击图中XX」图片点选题型而依赖
+#     opencv-python-headless / numpy / pillow / scipy。
+#     最新官网已改为数美 v1.0.4 滑块 (国内) / hCaptcha (海外),
+#     旧题型与解题逻辑均已失效, 相关依赖已移除。
+#   - Linux / GitHub Actions 还需安装浏览器本体:
+#       python -m playwright install --with-deps chromium
+#   - iSH / OpenMinis 环境会自动使用系统自带 minis-browser-use, 无需 playwright。
