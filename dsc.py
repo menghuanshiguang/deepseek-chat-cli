@@ -34,7 +34,7 @@ dsc - DeepSeek C端对话CLI (纯文本对话版, 参考 dsv 设计)
   DSV_EDGE_PROFILE  Windows 浏览器 profile 目录(默认 ~/.dsv_edge_profile)
   DSV_CHROME_PROFILE Linux 浏览器 profile 目录(默认 ~/.dsc_chrome_profile)
 """
-import sys, os, subprocess, json, time, urllib.request, shutil
+import sys, os, subprocess, json, time, re, urllib.request, shutil
 
 # ---------- 配置 ----------
 TOKEN_FILE = os.path.expanduser("~/.dsv_token")
@@ -53,7 +53,14 @@ BTN_LOGIN = ["登录", "Log in"]                                           # sig
 TAB_SMS = ["验证码登录", "Code login"]                                   # signInFormTabBySmsOption
 BTN_NEW_CHAT = ["开启新对话", "新对话", "New chat"]                       # 侧栏新建
 TXT_STOP = ["停止生成", "Stop"]                                          # chatInputStopButtonTooltip
-CODE_SENT = ["秒后可再次获取", "Resend after"]                            # verificationCodeCountDown
+CODE_SENT = ["秒后可再次获取", "秒后可重新获取", "秒后重新获取",
+             "秒后可再次发送", "秒后重发", "Resend after", "Resend in"]  # verificationCodeCountDown
+# 倒计时文案兜底(前端改文案时仍能识别): 「59 秒后可再次获取」「60s后重新发送」等
+CODE_SENT_RE = re.compile(r"\d+\s*(?:秒|s)\s*后\s*(?:可)?\s*(?:再次|重新)?\s*(?:获取|发送|重发)")
+# 发码失败的明确提示 -> 立即停等, 别再点验证码
+SEND_ERR_HINTS = ["发送过于频繁", "请求过于频繁", "操作过于频繁", "操作频繁",
+                  "请稍后再试", "发送失败", "验证失败", "网络异常",
+                  "Too many requests", "try again later"]
 # 错误/拒绝提示 -> 快速失败, 不傻等 (中英双语)
 ERR_TEXTS = ["违反使用规范", "消息未能发送", "你输入的信息过长", "服务器繁忙",
              "账户已被停用", "内容违规",
@@ -225,9 +232,13 @@ def get_token():
                      "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120"})
         with urllib.request.urlopen(req, timeout=10) as resp:
             d = json.loads(resp.read())
+        if not isinstance(d, dict):
+            log("[dsc] token校验异常: 响应非 JSON 对象:", str(d)[:120])
+            return None
         if d.get("code") == 0:
             return t
         log("[dsc] token 校验未通过: code=%s msg=%s" % (d.get("code"), d.get("msg")))
+        log("[dsc] 需重新登录: dsc --login <手机号> → dsc --verify <验证码>")
     except Exception as e:
         log("[dsc] token验证异常:", e)
     return None
@@ -285,6 +296,25 @@ def _err_text():
     return js(JS_LIB + """
     return String(__hasText(%s) || '');
     """ % jsl(ERR_TEXTS))
+
+
+def _wait_code_sent(timeout=12):
+    """轮询等待「短信已发出」的标志, 返回 (sent, reason)。
+
+    旧实现点完「发送验证码」只 sleep 2s 查一次 __hasText(CODE_SENT)。
+    新版前端倒计时渲染有 2~6s 延迟 -> 短信其实已发出, 却误报失败
+    (2026-10-27 真实踩到, 用户明明收到了验证码)。改为持续轮询。
+    """
+    end = time.time() + timeout
+    while time.time() < end:
+        t = str(js("return document.body ? (document.body.innerText || '') : '';") or "")
+        if any(h in t for h in CODE_SENT) or CODE_SENT_RE.search(t):
+            return True, "countdown"
+        for h in SEND_ERR_HINTS:
+            if h in t:
+                return False, "error:" + h
+        time.sleep(1)
+    return False, "timeout"
 
 
 def _type_into(placeholder_list, text):
@@ -538,9 +568,17 @@ def do_login(phone):
     log("[dsc] 点发送验证码:", r)
     time.sleep(2)
 
-    # 5. 处理风控验证(数美/ hCaptcha) + 等发码成功
-    sent = False
-    for attempt in range(3):
+    # 5. 处理风控验证(数美/ hCaptcha) + 等发码(轮询判定, 不做一次性判断)
+    sent, why = False, "timeout"
+    for attempt in range(4):
+        ok, why = _wait_code_sent(12 if attempt else 4)
+        if ok:
+            log("[dsc] ✅ 短信已发送(检测到倒计时)")
+            sent = True
+            break
+        if why.startswith("error:"):
+            log("[dsc] ⚠️ 页面提示:", why.split(":", 1)[1])
+            break
         cap = _detect_captcha()
         if isinstance(cap, dict) and (cap.get("shumei") or cap.get("modal") or cap.get("iframe")):
             log(f"[dsc] 检测到风控验证组件(第{attempt+1}次): "
@@ -559,26 +597,15 @@ def do_login(phone):
             return 'clicked:'+cx+','+cy;
             """)
             log("[dsc] 风控交互尝试:", pt)
-            time.sleep(3)
-        # 发码成功标志: 出现倒计时「N 秒后可再次获取」
-        ok = js(JS_LIB + """
-        return String(!!__hasText(%s));
-        """ % jsl(CODE_SENT))
-        if str(ok).strip().lower() == "true":
-            log("[dsc] ✅ 短信已发送(检测到倒计时)")
-            sent = True
-            break
-        # 风控未过时, 某些情况仍会直接发码, 也检查是否有错误提示
-        err = _err_text()
-        if err:
-            log("[dsc] 页面提示:", err)
-        time.sleep(2)
+        else:
+            log("[dsc] 未检测到风控组件, 继续等待发码...")
 
     if not sent:
-        log("[dsc] ❌ 短信未发送成功(风控未通过或触发频率限制)。")
+        log("[dsc] ⚠️ 未能确认短信是否已发送(风控未过/触发频率限制/倒计时未出现)。")
+        log("[dsc]    若手机已收到验证码, 请直接运行: dsc --verify <验证码>")
         if not headful():
             log("[dsc] 提示: 用 DSC_HEADFUL=1 dsc --login <手机号> 打开有头浏览器, 人工完成风控验证后重试。")
-        log("[dsc] 请等待 30s 后重试。")
+        log("[dsc] 否则等待 30s 后重试。")
         sys.exit(3)
     log("[dsc] ⏭ 短信已发送。CLI 立即退出(不阻塞调用方)。")
     log("[dsc] 收到验证码后, 请运行: dsc --verify <验证码>")
