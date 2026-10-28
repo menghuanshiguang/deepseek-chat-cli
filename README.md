@@ -145,6 +145,23 @@ DSC_HEADFUL=1 python dsc.py --login 13800138000
 | 3 | 短信发送失败（风控未通过 / 未找到输入框，等 30s 重试） |
 | 4 | token 无效/缺失 → 快速失败，提示先登录 |
 | 5 | 并发冲突（另一个 dsc/dsv 进程在跑） |
+| 6 | **风控熔断中**（已写日志并停止调用），`dsc --risk-clear` 手动解除 |
+
+### 风控熔断（2026-10-28）
+
+命中 DeepSeek 风控信号（频率限制文案、连续人机验证失败、HTTP 429/403）时：
+
+1. 往 `~/.dsv_risk.log` 追加一行 JSONL（时间 / 阶段 / 原因 / 证据片段 / 冷却时长）；
+2. 熔断状态写入 `~/.dsv_breaker.json`（默认冷却 60 分钟）；
+3. **冷却期内任何调用直接 exit 6**，不开浏览器、不打接口。
+
+```bash
+dsc --risk-status   # 熔断状态 + 最近 5 条记录
+dsc --risk-log      # 日志文件路径
+dsc --risk-clear    # 手动解除
+```
+
+环境变量：`DSV_RISK_LOG` / `DSV_BREAKER` / `DSV_RISK_COOLDOWN`（秒）。与 dsv 共用同一套状态文件（同账号同风险源）。
 
 ## 工作原理
 
