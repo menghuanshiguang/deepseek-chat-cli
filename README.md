@@ -135,6 +135,16 @@ DSC_HEADFUL=1 python dsc.py --login 13800138000
 
 > 登录和对话可以分开跑：登录时用手机号+验证码，对话时用 `DSV_TOKEN` secret，不需要每次都在 Actions 里登录。
 
+### 邮箱账号登录
+
+```bash
+dsc --login you@example.com --password '你的密码'
+DSC_PASSWORD='你的密码' dsc --login you@example.com   # 密码不进 shell history
+```
+
+国内版登录页的「验证码登录」只支持手机号;邮箱账号必须走「密码登录」Tab,
+CLI 会自动切换、填邮箱+密码、抓 token 并做一次接口校验。
+
 ## 退出码契约
 
 | 退出码 | 含义 |

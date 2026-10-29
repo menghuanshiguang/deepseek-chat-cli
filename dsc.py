@@ -8,7 +8,8 @@ dsc - DeepSeek C端对话CLI (纯文本对话版, 参考 dsv 设计)
   dsc "你好"
   dsc "用一句话介绍你自己"
   echo "你好" | dsc
-  dsc --login <手机号>
+  dsc --login <手机号>                      (短信验证码登录)
+  dsc --login <邮箱> --password <密码>      (邮箱账号: 密码登录; 密码也可用 DSC_PASSWORD)
   dsc --verify <短信验证码>
   dsc --logout
   dsc --keep "保留本次会话不删除"
@@ -33,6 +34,7 @@ dsc - DeepSeek C端对话CLI (纯文本对话版, 参考 dsv 设计)
 
 环境变量:
   DSC_TIMEOUT       回答等待上限秒数(默认 300)
+  DSC_PASSWORD      密码登录用密码(等同 --password, 避免密码进 shell history)
   DSC_HEADFUL=1     有头浏览器(人工过风控验证 / 观察过程)
   DSV_DEBUG=1       打印等待轮询细节
   DSV_EDGE          指定 Edge/Chrome 可执行文件路径
@@ -54,7 +56,10 @@ BASE = "https://chat.deepseek.com"
 SEL_MARKDOWN = ".ds-markdown"                    # 用户/助手消息正文容器
 SEL_TEXTAREA = "textarea"                        # 输入框实为 <textarea class="ds-textarea__textarea">
 PH_CHAT = ["给 DeepSeek 发送消息", "Message DeepSeek"]                  # chatInputPlaceholderChat
-PH_ACCOUNT = ["请输入手机号/邮箱地址", "Phone number / email address"]    # signInEmailAndPhonePlaceholder
+PH_ACCOUNT = ["请输入手机号/邮箱地址", "请输入手机号/邮箱地址", "请输入手机号",
+              "请输入邮箱 / +86手机号", "Phone number / email address"]  # signInEmailAndPhonePlaceholder
+TAB_PASSWORD = ["密码登录", "Password login"]                          # signInFormTabByPasswordOption
+PH_PASSWORD = ["请输入密码", "Password"]                                # password 输入框
 PH_CODE = ["请输入验证码", "Code"]                                       # inputSmsVerificationCode
 BTN_SEND_CODE = ["发送验证码", "Send code"]                              # sendVerificationCode
 BTN_LOGIN = ["登录", "Log in"]                                           # signIn
@@ -660,6 +665,130 @@ def _click_tab_sms():
     return str(r).startswith("tab:")
 
 
+# 登录失败提示(精确匹配, 避开"未注册的手机号将自动注册"这类法务文案)
+LOGIN_ERR_HINTS = ["密码错误或账户不存在", "密码错误", "账户不存在", "账号不存在",
+                   "密码不能为空", "格式不正确", "登录失败", "账号已被停用",
+                   "操作频繁", "请稍后再试", "网络异常", "网络错误", "网络繁忙",
+                   "incorrect password", "doesn't exist", "Login failed",
+                   "Network error"]
+
+
+def _poll_login_result(timeout=20):
+    """提交登录后轮询: 成功返回 token(已落盘), 失败返回页面错误提示。
+
+    返回 (ok, err)。旧实现只 sleep 4s 读一次 token —— 错误 toast 早就消失,
+    失败时只剩一句"登录可能失败", 无法判断是密码错还是被风控。
+    """
+    for _ in range(timeout):
+        time.sleep(1)
+        page = str(js("return document.body ? (document.body.innerText || '') : '';") or "")
+        url = str(js("return location.href;") or "")
+        if "sign_in" not in url:
+            tok = js(JS_LIB + """
+            var t=localStorage.getItem('userToken'); if(!t) return '';
+            try{var o=JSON.parse(t); if(o&&typeof o==='object'&&o.value) return String(o.value);}catch(e){}
+            return String(t);
+            """)
+            tok = str(tok or "").strip()
+            if len(tok) > 20:
+                with open(TOKEN_FILE, "w") as f:
+                    f.write(tok)
+                try:
+                    os.chmod(TOKEN_FILE, 0o600)
+                except OSError:
+                    pass
+                if get_token():
+                    log(f"[dsc] ✅ 登录成功! token 已保存并校验通过 ({len(tok)} 字符)")
+                    return True, ""
+                return False, "token 已取到但接口校验未通过(会话被风控/失效)"
+        if os.environ.get("DSV_DEBUG"):
+            log(f"[dsc] poll[{_}]: {page.strip()[-90:]!r}")
+        for h in LOGIN_ERR_HINTS:
+            if h in page:
+                return False, h
+    return False, ""
+
+
+def do_password_login(account, password):
+    """邮箱/手机号 + 密码登录(邮箱账号只能走这条; 国内版验证码登录只认手机号)
+
+    用法: dsc --login <邮箱> --password <密码>   (密码也可用 DSC_PASSWORD 传入)
+    """
+    if not account or not password:
+        log("用法: dsc --login <手机号/邮箱> --password <密码>")
+        sys.exit(2)
+    log("[dsc] 开始密码登录: %s" % _mask_account(account))
+    run(["navigate", "--url", BASE + "/sign_in"])
+    time.sleep(2)
+    # 1. 切到「密码登录」Tab(若已经在密码登录页则跳过)
+    #    注意: 登录页有个 .ds-sign-in-form__social-link-measure 的测量用副本,
+    #    通用 __clickText 会先点到它(点了没反应), 这里优先点真正的 .ds-button
+    already = js("""return String(!![...document.querySelectorAll('input')].find(function(i){return i.type==='password';}));""")
+    r = "already" if str(already).strip().lower() == "true" else js("""
+    var texts=%s;
+    function hit(e){var t=(e.innerText||e.textContent||'').trim(); return texts.indexOf(t)>=0;}
+    function vis(e){var b=e.getBoundingClientRect(); return b.width>0&&b.height>0;}
+    var c=[...document.querySelectorAll('.ds-button__content')];
+    for(var i=0;i<c.length;i++){
+      if(hit(c[i])&&vis(c[i])){ (c[i].closest('.ds-button')||c[i]).click(); return 'clicked:btn'; }
+    }
+    var all=[...document.querySelectorAll('button,a,span,div')];
+    for(var j=0;j<all.length;j++){var e=all[j];
+      if(e.children.length===0&&hit(e)&&vis(e)){ (e.closest('.ds-button')||e).click(); return 'clicked:leaf'; }
+    }
+    return 'no_tab';
+    """ % json.dumps(TAB_PASSWORD))
+    log("[dsc] 切Tab:", r)
+    time.sleep(1.2)
+    has_pw = js("""return String(!![...document.querySelectorAll('input')].find(function(i){return i.type==='password';}));""")
+    if str(has_pw).strip().lower() != "true":
+        log("[dsc] ⚠️ 切换后仍看不到密码输入框, 页面可能已改版")
+    # 2. 填账号
+    r = _type_into(PH_ACCOUNT, account)
+    log("[dsc] 填账号:", r)
+    if str(r).strip() != "ok":
+        log("[dsc] ❌ 未找到账号输入框(placeholder 契约: %s)" % PH_ACCOUNT[0])
+        return False
+    time.sleep(0.4)
+    # 3. 填密码
+    r = js("""
+    var p=[...document.querySelectorAll('input')].find(function(i){return i.type==='password';});
+    if(!p) return 'no_pw';
+    var s=Object.getOwnPropertyDescriptor(HTMLInputElement.prototype,'value').set;
+    s.call(p,%s); p.dispatchEvent(new Event('input',{bubbles:true}));
+    return 'ok';
+    """ % json.dumps(password))
+    log("[dsc] 填密码:", r)
+    if str(r).strip() != "ok":
+        log("[dsc] ❌ 未找到密码输入框, 站点可能改版")
+        return False
+    time.sleep(0.4)
+    # 4. 点登录
+    r = js(JS_LIB + """
+    var hit=__clickText(%s, true);
+    return hit ? ('clicked:'+hit) : 'NO_BTN';
+    """ % jsl(BTN_LOGIN))
+    log("[dsc] 点登录:", r)
+    # 5. 轮询结果
+    ok, err = _poll_login_result()
+    if ok:
+        return True
+    log("[dsc] ❌ 登录失败:", err or "既没跳转也没报错(账号密码或网络问题)")
+    page = str(js("return document.body ? (document.body.innerText || '') : '';") or "")
+    rc = risk_scan_text(page, "password-login")
+    if rc:
+        sys.exit(rc)
+    return False
+
+
+def _mask_account(a):
+    a = str(a or "")
+    if "@" in a:
+        name, _, dom = a.partition("@")
+        return (name[:2] + "***@" + dom) if name else "***@" + dom
+    return a[:3] + "****" + a[-2:] if len(a) >= 6 else "***"
+
+
 def _detect_captcha():
     """探测风控验证组件是否出现。
 
@@ -688,7 +817,11 @@ def do_login(phone):
     收到短信后单独运行 `dsc --verify <验证码>` 完成登录。
     """
     if not phone:
-        log("用法: dsc --login <手机号>")
+        log("用法: dsc --login <手机号>  |  邮箱账号: dsc --login <邮箱> --password <密码>")
+        sys.exit(2)
+    if "@" in str(phone):
+        log("[dsc] ❌ 邮箱账号请用密码登录(国内版验证码登录只支持手机号):")
+        log("[dsc]    dsc --login <邮箱> --password <密码>")
         sys.exit(2)
     log(f"[dsc] 开始登录: {phone[:3]}****{phone[-2:]}")
     # 1. 打开登录页(注意: 外壳对 / 与 /sign_in 返回同一 HTML, 仍用 /sign_in 语义更明确)
@@ -791,34 +924,13 @@ def do_verify(code):
     return hit ? ('clicked:'+hit) : 'NO_BTN';
     """ % jsl(BTN_LOGIN))
     log("[dsc] 点登录:", r)
-    time.sleep(4)
-    # 3. 提取 token 并存盘
-    #    最新前端 localStorage['userToken'] 为裸 token 字符串
-    tok = js("""
-    var t=localStorage.getItem('userToken');
-    if(!t) return '';
-    try { var o=JSON.parse(t); if(o && typeof o==='object' && o.value) return String(o.value); } catch(e){}
-    return String(t);
-    """)
-    tok = str(tok).strip() if tok else ""
-    if tok and len(tok) > 20:
-        with open(TOKEN_FILE, "w") as f:
-            f.write(tok)
-        try:
-            os.chmod(TOKEN_FILE, 0o600)
-        except OSError:
-            pass
-        # 4. 顺带校验一次, 确认真的可用
-        if get_token():
-            log(f"[dsc] ✅ 登录成功! token 已保存并校验通过 ({len(tok)} 字符)")
-            return True
-        log("[dsc] ⚠️ token 已保存, 但接口校验未通过(可能风控/需要重登)")
+    # 3. 轮询结果 + 抓取 token 并存盘(内部已做一次接口校验)
+    ok, err = _poll_login_result()
+    if ok:
         return True
-    # 失败: 输出页面提示便于定位
+    log("[dsc] ❌ 登录失败:", err or "既没跳转也没报错(验证码错误或页面异常)")
     cur = js("return location.href;")
-    log("[dsc] 登录可能失败, 当前URL:", str(cur)[:100])
-    tail = js("var t=document.body.innerText; return String(t.slice(-200));")
-    log("[dsc] 页面提示:", str(tail)[:200])
+    log("[dsc] 当前URL:", str(cur)[:100])
     return False
 
 
@@ -905,8 +1017,18 @@ def main():
     # 风控熔断守卫: 冷却期内直接退出(exit 6), 不开浏览器/不碰接口
     risk_guard()
     if sub == "--login":
-        phone = args[1] if len(args) > 1 else None
-        do_login(phone)
+        rest = args[1:]
+        pwd = None
+        if "--password" in rest:
+            i = rest.index("--password")
+            pwd = rest[i + 1] if len(rest) > i + 1 else None
+            rest = rest[:i] + rest[i + 2:]
+        account = rest[0] if rest else None
+        pwd = pwd or os.environ.get("DSC_PASSWORD") or None
+        if pwd:
+            # 邮箱/手机号 + 密码登录(邮箱账号只能走这条)
+            sys.exit(0 if do_password_login(account, pwd) else 3)
+        do_login(account)
         return
     if sub == "--verify":
         code = args[1] if len(args) > 1 else None
