@@ -145,6 +145,12 @@ DSC_PASSWORD='你的密码' dsc --login you@example.com   # 密码不进 shell h
 国内版登录页的「验证码登录」只支持手机号;邮箱账号必须走「密码登录」Tab,
 CLI 会自动切换、填邮箱+密码、抓 token 并做一次接口校验。
 
+## 串行锁（与 dsv 共用）
+
+dsv / dsc 共用 `~/.dsv.lock`，并发调用时会**排队等待**（默认 300s）而不是直接失败；
+持有者崩溃留下的陈旧锁（进程已死 / >600s）会自动接管。可用 `DSV_LOCK` /
+`DSV_LOCK_WAIT` / `DSV_LOCK_STALE` 覆盖。
+
 ## 退出码契约
 
 | 退出码 | 含义 |

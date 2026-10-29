@@ -935,38 +935,19 @@ def do_verify(code):
 
 
 # ---------- 并发锁 ----------
-LOCK_FILE = os.path.join(os.path.dirname(os.path.realpath(__file__)), ".dsv.lock")
-
-
-def acquire_lock():
-    """简单并发锁: 已有 dsc/dsv 在跑则退出, 避免浏览器状态互相干扰。
-    锁文件记录 PID, 持有者已死(被 SIGTERM/崩溃)则自动接管, 不留死锁。
-    注意: Windows 没有 /proc, 用 tasklist 判定存活。
-    """
-    while True:
-        try:
-            fd = os.open(LOCK_FILE, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-            os.write(fd, str(os.getpid()).encode())
-            os.close(fd)
-            return True
-        except FileExistsError:
-            try:
-                with open(LOCK_FILE) as f:
-                    pid = int(f.read().strip() or "0")
-            except (OSError, ValueError):
-                pid = 0
-            if pid and _pid_alive(pid):
-                log("[dsc] ⚠️ 另一个 dsc/dsv 进程正在运行, 请等待完成或删除 .dsv.lock")
-                return False
-            try:
-                os.remove(LOCK_FILE)
-            except OSError:
-                return False
-            log("[dsc] 检测到残留锁(持有者已退出), 已接管")
+LOCK_FILE = os.path.expanduser(os.environ.get("DSV_LOCK") or "~/.dsv.lock")
+LOCK_WAIT = int(os.environ.get("DSV_LOCK_WAIT") or 300)     # 抢不到锁时最多排队等待秒数
+LOCK_STALE = int(os.environ.get("DSV_LOCK_STALE") or 600)   # 锁文件超过该秒数视为陈旧
 
 
 def _pid_alive(pid):
-    """跨平台判断 PID 是否存活"""
+    """跨平台判断 PID 是否存活(Windows 没有 /proc, 用 tasklist)"""
+    try:
+        pid = int(pid)
+    except (TypeError, ValueError):
+        return False
+    if pid <= 0:
+        return False
     if sys.platform == "win32":
         try:
             out = subprocess.run(["tasklist", "/FI", "PID eq %d" % pid, "/NH"],
@@ -977,15 +958,80 @@ def _pid_alive(pid):
     try:
         os.kill(pid, 0)
         return True
-    except OSError:
+    except ProcessLookupError:
         return False
+    except PermissionError:
+        return True
+
+
+def acquire_lock(wait=None):
+    """全局串行锁: dsv 与 dsc 共用同一把锁(默认 ~/.dsv.lock)。
+
+    两个 CLI 驱动同一个浏览器、打同一个账号, 并发跑极易触发风控,
+    所以这里不是"抢不到就退", 而是排队等待(wait 秒), 超时才 exit 5。
+    """
+    if wait is None:
+        wait = LOCK_WAIT
+    deadline = time.time() + max(0, wait)
+    logged = False
+    while True:
+        try:
+            fd = os.open(LOCK_FILE, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            os.write(fd, json.dumps({"pid": os.getpid(), "tool": "dsc",
+                                     "ts": time.time()}).encode())
+            os.close(fd)
+            return True
+        except FileExistsError:
+            holder = {}
+            try:
+                with open(LOCK_FILE, encoding="utf-8") as f:
+                    holder = json.loads(f.read() or "{}")
+            except Exception:
+                try:
+                    with open(LOCK_FILE) as f:
+                        holder = {"pid": int(f.read().strip() or 0)}
+                except Exception:
+                    holder = {}
+            if not isinstance(holder, dict):
+                holder = {}
+            try:
+                age = time.time() - float(holder.get("ts") or 0)
+            except (TypeError, ValueError):
+                age = LOCK_STALE + 1
+            pid = holder.get("pid") or 0
+            if age > LOCK_STALE or not _pid_alive(pid):
+                log("[%s] 清理残留锁(持有者已退出): %s" % ("dsc", holder))
+                try:
+                    os.remove(LOCK_FILE)
+                except OSError:
+                    pass
+                continue
+            if time.time() >= deadline:
+                log("[%s] ⚠️ 另一个 %s 进程(pid=%s)占用锁, 等待 %ds 超时"
+                    % ("dsc", holder.get("tool") or "dsv/dsc", pid, wait))
+                log("[%s]    dsv/dsc 必须串行(同一账号/同一浏览器), 请稍后重试" % "dsc")
+                return False
+            if not logged:
+                log("[%s] ⏳ 另一个 %s 进程(pid=%s)正在运行, 排队等待..."
+                    % ("dsc", holder.get("tool") or "dsv/dsc", pid))
+                logged = True
+            time.sleep(1)
 
 
 def release_lock():
+    """只释放自己持有的锁"""
+    try:
+        with open(LOCK_FILE, encoding="utf-8") as f:
+            holder = json.loads(f.read() or "{}")
+        if isinstance(holder, dict) and holder.get("pid") not in (None, os.getpid()):
+            return
+    except Exception:
+        pass
     try:
         os.remove(LOCK_FILE)
     except OSError:
         pass
+
 
 def main():
     T0 = time.time()
